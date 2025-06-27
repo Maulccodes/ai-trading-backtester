@@ -1,0 +1,308 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from sklearn.linear_model import LinearRegression
+import plotly.graph_objs as go
+import io
+from fpdf import FPDF  # pip install fpdf
+
+# ---------------------------
+# Page Setup
+# ---------------------------
+st.set_page_config(page_title="AI Trading Strategy Backtester", layout="wide")
+st.title("📈 AI Trading Strategy Backtester")
+
+# ---------------------------
+# Sidebar Inputs
+# ---------------------------
+strategy_choice = st.sidebar.selectbox(
+    "Choose Strategy",
+    ["Moving Average Crossover", "RSI", "MACD", "Ensemble (Compare All)"]
+)
+
+short_window = st.sidebar.slider("Short Moving Average Window", 5, 50, 20)
+long_window = st.sidebar.slider("Long Moving Average Window", 10, 200, 50)
+
+ticker_input = st.sidebar.text_input("Or enter a Ticker (e.g., AAPL)", value="")
+
+# ---------------------------
+# Data Loaders
+# ---------------------------
+def load_data_from_file(file):
+    try:
+        df = pd.read_csv(file)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [' '.join(col).strip() for col in df.columns]
+        if not any('Close' in col for col in df.columns):
+            st.error("❌ CSV must contain a 'Close' column.")
+            return None, None
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df.dropna(subset=['Date'], inplace=True)
+        df.set_index('Date', inplace=True)
+        close_col = next((col for col in df.columns if 'Close' in col), None)
+        return df, close_col
+    except Exception as e:
+        st.error(f"Error loading file: {e}")
+        return None, None
+
+def load_data_from_yahoo(ticker):
+    try:
+        df = yf.download(ticker, period="1y")
+        if df.empty:
+            st.error("No data found.")
+            return None, None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [' '.join(col).strip() for col in df.columns]
+        close_col = next((col for col in df.columns if 'Close' in col), 'Close')
+        return df, close_col
+    except Exception as e:
+        st.error(f"Yahoo error: {e}")
+        return None, None
+
+# ---------------------------
+# Strategies Implementations
+# ---------------------------
+def apply_ma_strategy(df, close_col, short, long):
+    df = df.copy()
+    df['ShortMA'] = df[close_col].rolling(window=short).mean()
+    df['LongMA'] = df[close_col].rolling(window=long).mean()
+    df['Signal'] = 0
+    df['Signal'][short:] = (df['ShortMA'][short:] > df['LongMA'][short:]).astype(int)
+    df['Position'] = df['Signal'].diff()
+    return df.dropna()
+
+def apply_rsi_strategy(df, close_col, period=14):
+    df = df.copy()
+    delta = df[close_col].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    df['Signal'] = 0
+    df.loc[df['RSI'] < 30, 'Signal'] = 1   # Buy
+    df.loc[df['RSI'] > 70, 'Signal'] = 0   # Sell
+    df['Position'] = df['Signal'].diff()
+    return df.dropna()
+
+def apply_macd_strategy(df, close_col):
+    df = df.copy()
+    exp1 = df[close_col].ewm(span=12, adjust=False).mean()
+    exp2 = df[close_col].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['Signal Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['Signal'] = (df['MACD'] > df['Signal Line']).astype(int)
+    df['Position'] = df['Signal'].diff()
+    return df.dropna()
+
+# ---------------------------
+# AI Predictor
+# ---------------------------
+def ai_predict_next_close(df, close_col):
+    df = df.copy().dropna()
+    X = np.arange(len(df)).reshape(-1, 1)
+    y = df[close_col].values
+    model = LinearRegression().fit(X, y)
+    next_day = np.array([[len(df) + 1]])
+    return model.predict(next_day)[0]
+
+# ---------------------------
+# Calculate Returns
+# ---------------------------
+def calculate_returns(df, close_col):
+    df = df.copy()
+    df['Returns'] = df[close_col].pct_change()
+    df['Strategy'] = df['Returns'] * df['Signal'].shift(1)
+    df['Cumulative Market Returns'] = (1 + df['Returns']).cumprod()
+    df['Cumulative Strategy Returns'] = (1 + df['Strategy']).cumprod()
+    return df
+
+# ---------------------------
+# Generate PDF Report
+# ---------------------------
+def generate_pdf(strategy_name, market_return, strategy_return):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, "AI Trading Strategy Backtester Report", ln=True, align='C')
+    pdf.ln(10)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, f"Strategy: {strategy_name}", ln=True)
+    pdf.cell(0, 10, f"Final Market Return: {market_return:.2f}x", ln=True)
+    pdf.cell(0, 10, f"Final Strategy Return: {strategy_return:.2f}x", ln=True)
+    pdf.ln(10)
+    pdf.cell(0, 10, "Generated by AI Trading Strategy Backtester App", ln=True, align='C')
+
+    # Output PDF to bytes
+    pdf_output = pdf.output(dest='S').encode('latin-1')
+    return pdf_output
+
+# ---------------------------
+# Load Data
+# ---------------------------
+df, close_col = None, None
+uploaded_file = st.file_uploader("📂 Upload CSV with Date & Close", type=["csv"])
+
+if uploaded_file:
+    df, close_col = load_data_from_file(uploaded_file)
+elif ticker_input:
+    df, close_col = load_data_from_yahoo(ticker_input.strip().upper())
+
+# ---------------------------
+# Main Execution
+# ---------------------------
+if df is not None and close_col is not None:
+    st.subheader("📊 Price Chart")
+    st.line_chart(df[close_col])
+
+    try:
+        # Ensemble logic: Run all strategies and compare if chosen
+        if strategy_choice == "Ensemble (Compare All)":
+            # Run all three
+            ma_df = apply_ma_strategy(df, close_col, short_window, long_window)
+            rsi_df = apply_rsi_strategy(df, close_col)
+            macd_df = apply_macd_strategy(df, close_col)
+
+            # Calculate returns for each
+            ma_df = calculate_returns(ma_df, close_col)
+            rsi_df = calculate_returns(rsi_df, close_col)
+            macd_df = calculate_returns(macd_df, close_col)
+
+            # Final returns
+            ma_return = ma_df['Cumulative Strategy Returns'].iloc[-1]
+            rsi_return = rsi_df['Cumulative Strategy Returns'].iloc[-1]
+            macd_return = macd_df['Cumulative Strategy Returns'].iloc[-1]
+
+            # Put together for plotting
+            combined = pd.DataFrame({
+                'Market': ma_df['Cumulative Market Returns'],
+                'MA Strategy': ma_df['Cumulative Strategy Returns'],
+                'RSI Strategy': rsi_df['Cumulative Strategy Returns'],
+                'MACD Strategy': macd_df['Cumulative Strategy Returns']
+            })
+
+            # Plot comparison chart
+            st.subheader("📈 Strategy Comparison: Cumulative Returns")
+            fig = go.Figure()
+            for col in combined.columns:
+                fig.add_trace(go.Scatter(x=combined.index, y=combined[col], name=col))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Determine best strategy
+            returns = {
+                "Moving Average Crossover": ma_return,
+                "RSI": rsi_return,
+                "MACD": macd_return
+            }
+            best_strategy_name = max(returns, key=returns.get)
+            best_return = returns[best_strategy_name]
+
+            st.markdown(f"### 🏆 Best Strategy: **{best_strategy_name}** with final return {best_return:.2f}x")
+
+            # Show detailed results for best strategy
+            st.subheader(f"🔎 Detailed Results for {best_strategy_name}")
+
+            # Select df of best strategy
+            best_df = {'Moving Average Crossover': ma_df,
+                       'RSI': rsi_df,
+                       'MACD': macd_df}[best_strategy_name]
+
+            # Show price + strategy signals chart
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=best_df.index, y=best_df[close_col], name='Close Price'))
+
+            if best_strategy_name == "Moving Average Crossover":
+                fig2.add_trace(go.Scatter(x=best_df.index, y=best_df['ShortMA'], name='Short MA'))
+                fig2.add_trace(go.Scatter(x=best_df.index, y=best_df['LongMA'], name='Long MA'))
+            elif best_strategy_name == "RSI":
+                fig2.add_trace(go.Scatter(x=best_df.index, y=best_df['RSI'], name='RSI'))
+            elif best_strategy_name == "MACD":
+                fig2.add_trace(go.Scatter(x=best_df.index, y=best_df['MACD'], name='MACD'))
+                fig2.add_trace(go.Scatter(x=best_df.index, y=best_df['Signal Line'], name='Signal Line'))
+
+            st.plotly_chart(fig2, use_container_width=True)
+
+            # AI predicted next close price
+            predicted_price = ai_predict_next_close(best_df, close_col)
+            st.metric("📉 AI Predicted Next Close", f"${predicted_price:.2f}")
+
+            # Export CSV for best strategy
+            csv_buffer = best_df.to_csv(index=True).encode()
+            st.download_button(
+                label="📥 Download Best Strategy CSV",
+                data=csv_buffer,
+                file_name=f"{best_strategy_name.replace(' ', '_').lower()}_backtest.csv",
+                mime='text/csv'
+            )
+
+            # Export PDF summary
+            pdf_data = generate_pdf(best_strategy_name, best_df['Cumulative Market Returns'].iloc[-1], best_return)
+            st.download_button(
+                label="🧾 Download PDF Summary Report",
+                data=pdf_data,
+                file_name=f"{best_strategy_name.replace(' ', '_').lower()}_report.pdf",
+                mime='application/pdf'
+            )
+
+        else:
+            # Single strategy flow
+            if strategy_choice == "Moving Average Crossover":
+                df = apply_ma_strategy(df, close_col, short_window, long_window)
+            elif strategy_choice == "RSI":
+                df = apply_rsi_strategy(df, close_col)
+            elif strategy_choice == "MACD":
+                df = apply_macd_strategy(df, close_col)
+
+            df = calculate_returns(df, close_col)
+
+            st.subheader(f"🧠 {strategy_choice} Strategy Chart")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df.index, y=df[close_col], name='Close Price'))
+
+            if strategy_choice == "Moving Average Crossover":
+                fig.add_trace(go.Scatter(x=df.index, y=df['ShortMA'], name='Short MA'))
+                fig.add_trace(go.Scatter(x=df.index, y=df['LongMA'], name='Long MA'))
+            elif strategy_choice == "RSI":
+                fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name='RSI'))
+            elif strategy_choice == "MACD":
+                fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], name='MACD'))
+                fig.add_trace(go.Scatter(x=df.index, y=df['Signal Line'], name='Signal Line'))
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            predicted_price = ai_predict_next_close(df, close_col)
+            st.metric("📉 AI Predicted Next Close", f"${predicted_price:.2f}")
+
+            st.subheader("💰 Cumulative Returns")
+            st.line_chart(df[['Cumulative Market Returns', 'Cumulative Strategy Returns']])
+
+            market_return = df['Cumulative Market Returns'].iloc[-1]
+            strategy_return = df['Cumulative Strategy Returns'].iloc[-1]
+            st.write(f"📊 **Final Market Return:** {market_return:.2f}x")
+            st.write(f"📊 **Final Strategy Return:** {strategy_return:.2f}x")
+
+            # Export CSV
+            csv_buffer = df.to_csv(index=True).encode()
+            st.download_button(
+                label="📥 Download Backtest CSV",
+                data=csv_buffer,
+                file_name=f"{strategy_choice.replace(' ', '_').lower()}_backtest.csv",
+                mime='text/csv'
+            )
+
+            # Export PDF summary
+            pdf_data = generate_pdf(strategy_choice, market_return, strategy_return)
+            st.download_button(
+                label="🧾 Download PDF Summary Report",
+                data=pdf_data,
+                file_name=f"{strategy_choice.replace(' ', '_').lower()}_report.pdf",
+                mime='application/pdf'
+            )
+
+    except Exception as e:
+        st.error(f"⚠️ Error running strategy: {e}")
+        st.write("📋 Available Columns:", df.columns.tolist())
+else:
+    st.info("🟡 Upload a CSV or enter a ticker to get started.")
