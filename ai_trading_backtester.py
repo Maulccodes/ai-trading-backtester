@@ -6,6 +6,7 @@ from sklearn.linear_model import LinearRegression
 import plotly.graph_objs as go
 import io
 from fpdf import FPDF  # pip install fpdf
+import openai
 
 # ---------------------------
 # Page Setup
